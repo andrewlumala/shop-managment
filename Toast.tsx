@@ -1,49 +1,53 @@
-export interface ConfirmState {
-  title: string;
-  message: string;
-  onConfirm: () => void;
-}
+import type { SaleRecord } from '@/types';
+import { formatMoney } from '@/lib/currency';
 
-export function ConfirmDialog({
-  state,
-  onCancel,
-}: {
-  state: ConfirmState | null;
-  onCancel: () => void;
-}) {
-  if (!state) return null;
+export function RevenueChart({ sales, currency }: { sales: SaleRecord[]; currency: string }) {
+  const days: { label: string; date: string; revenue: number }[] = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const iso = d.toISOString().split('T')[0];
+    const revenue = sales.filter((s) => s.date === iso).reduce((sum, s) => sum + s.totalRevenue, 0);
+    days.push({ label: d.toLocaleDateString('en-GB', { weekday: 'short' }), date: iso, revenue });
+  }
+
+  const max = Math.max(...days.map((d) => d.revenue), 1);
+  const width = 560;
+  const height = 180;
+  const barGap = 16;
+  const barWidth = (width - barGap * (days.length - 1)) / days.length;
 
   return (
-    <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/60" onClick={onCancel}>
-      <div
-        className="w-full max-w-sm bg-neutral-900 border border-neutral-800 rounded-2xl p-6 shadow-2xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="w-12 h-12 rounded-full bg-red-500/10 flex items-center justify-center mb-4">
-          <svg className="w-6 h-6 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-          </svg>
-        </div>
-        <h3 className="text-lg font-semibold text-white mb-1">{state.title}</h3>
-        <p className="text-neutral-400 text-sm mb-6">{state.message}</p>
-        <div className="flex gap-3">
-          <button
-            onClick={onCancel}
-            className="flex-1 px-4 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-white font-medium rounded-xl transition-all"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={() => {
-              state.onConfirm();
-              onCancel();
-            }}
-            className="flex-1 px-4 py-2.5 bg-red-500 hover:bg-red-600 text-white font-medium rounded-xl transition-all"
-          >
-            Delete
-          </button>
-        </div>
-      </div>
-    </div>
+    <svg viewBox={`0 0 ${width} ${height + 32}`} className="w-full h-auto" role="img" aria-label="Revenue for the last 7 days">
+      {days.map((d, i) => {
+        const barHeight = Math.max((d.revenue / max) * height, d.revenue > 0 ? 4 : 0);
+        const x = i * (barWidth + barGap);
+        const y = height - barHeight;
+        return (
+          <g key={d.date}>
+            <title>
+              {d.label}: {formatMoney(d.revenue, currency)}
+            </title>
+            <rect
+              x={x}
+              y={y}
+              width={barWidth}
+              height={barHeight}
+              rx={4}
+              fill={d.revenue > 0 ? 'url(#barGradient)' : '#262626'}
+            />
+            <text x={x + barWidth / 2} y={height + 20} textAnchor="middle" fontSize="11" fill="#a3a3a3">
+              {d.label}
+            </text>
+          </g>
+        );
+      })}
+      <defs>
+        <linearGradient id="barGradient" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#22d3ee" />
+          <stop offset="100%" stopColor="#10b981" />
+        </linearGradient>
+      </defs>
+    </svg>
   );
 }

@@ -1,7 +1,3 @@
-export function formatCurrency(amount: number): string {
-  return `UGX ${amount.toLocaleString()}`;
-}
-
 export function formatDateDMY(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;

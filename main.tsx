@@ -8,6 +8,8 @@ import type {
   Tab,
   Page,
   ToastMessage,
+  AppSettings,
+  InventorySort,
 } from '@/types';
 import {
   getUsers,
@@ -18,14 +20,21 @@ import {
   saveUserSales,
   loadUserNotes,
   saveUserNotes,
+  loadUserSettings,
+  saveUserSettings,
   hasSeededData,
   markSeeded,
 } from '@/lib/storage';
-import { formatCurrency, formatDateDMY, todayISO, startOfWeekISO, startOfMonthISO } from '@/lib/format';
+import { formatDateDMY, todayISO, startOfWeekISO, startOfMonthISO } from '@/lib/format';
+import { formatMoney } from '@/lib/currency';
 import { downloadCSV } from '@/lib/csv';
+import { downloadJSON, parseBackup } from '@/lib/backup';
 import { ToastContainer } from '@/components/Toast';
 import { ConfirmDialog, type ConfirmState } from '@/components/ConfirmDialog';
 import { EditItemModal } from '@/components/EditItemModal';
+import { SettingsPanel } from '@/components/SettingsPanel';
+import { RevenueChart } from '@/components/RevenueChart';
+import { Pagination } from '@/components/Pagination';
 
 // Sample data — only used to seed a brand-new account's first sign-in.
 const initialInventory: InventoryItem[] = [
@@ -39,12 +48,17 @@ const initialSales: SaleRecord[] = [
   { id: '2', date: '2026-07-19', itemName: 'sugar', quantitySold: 4, totalRevenue: 16000, totalProfit: 4000 },
 ];
 
+const DEFAULT_SETTINGS: AppSettings = { businessName: 'Kikuubo Wholesale Tracker', currency: 'UGX' };
+const INVENTORY_PAGE_SIZE = 8;
+const SALES_PAGE_SIZE = 10;
+
 export default function App() {
   const [page, setPage] = useState<Page>('home');
   const [activeTab, setActiveTab] = useState<Tab>('dashboard');
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
   const [sales, setSales] = useState<SaleRecord[]>([]);
   const [notes, setNotes] = useState<Note[]>([]);
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [newNote, setNewNote] = useState('');
   const [sideMenuOpen, setSideMenuOpen] = useState(false);
   const [loginForm, setLoginForm] = useState({ username: '', password: '' });
@@ -59,6 +73,11 @@ export default function App() {
   const [editingItem, setEditingItem] = useState<InventoryItem | null>(null);
   const [inventorySearch, setInventorySearch] = useState('');
   const [salesSearch, setSalesSearch] = useState('');
+  const [salesFrom, setSalesFrom] = useState('');
+  const [salesTo, setSalesTo] = useState('');
+  const [inventorySort, setInventorySort] = useState<InventorySort | null>(null);
+  const [inventoryPage, setInventoryPage] = useState(1);
+  const [salesPage, setSalesPage] = useState(1);
 
   const addToast = (message: string, type: ToastMessage['type'] = 'info') => {
     const id = String(Date.now() + Math.random());
@@ -78,7 +97,7 @@ export default function App() {
   }, []);
 
   // Load this user's data whenever they sign in (each account has its own
-  // inventory / sales / notes, namespaced by username in localStorage).
+  // inventory / sales / notes / settings, namespaced by username).
   useEffect(() => {
     if (!currentUser) {
       setDataLoaded(false);
@@ -93,6 +112,7 @@ export default function App() {
       setSales(loadUserSales(currentUser.username, []));
     }
     setNotes(loadUserNotes(currentUser.username));
+    setSettings(loadUserSettings(currentUser.username));
     setDataLoaded(true);
   }, [currentUser]);
 
@@ -109,6 +129,10 @@ export default function App() {
   useEffect(() => {
     if (currentUser && dataLoaded) saveUserNotes(currentUser.username, notes);
   }, [notes, currentUser, dataLoaded]);
+
+  useEffect(() => {
+    if (currentUser && dataLoaded) saveUserSettings(currentUser.username, settings);
+  }, [settings, currentUser, dataLoaded]);
 
   // Handle registration
   const handleRegister = (e: React.FormEvent) => {
@@ -175,6 +199,7 @@ export default function App() {
     setInventory([]);
     setSales([]);
     setNotes([]);
+    setSettings(DEFAULT_SETTINGS);
     setPage('home');
     localStorage.removeItem('wholesale-logged-in');
     localStorage.removeItem('wholesale-current-user');
@@ -204,6 +229,69 @@ export default function App() {
     setNotes(notes.map((note) => (note.id === id ? { ...note, content } : note)));
   };
 
+  // Settings, account, and data-management handlers
+  const handleSaveSettings = (next: AppSettings) => {
+    setSettings(next);
+    addToast('Business settings saved', 'success');
+  };
+
+  const handleChangePassword = (current: string, next: string): { success: boolean; error?: string } => {
+    if (!currentUser) return { success: false, error: 'Not signed in.' };
+    const users = getUsers();
+    const idx = users.findIndex((u) => u.username === currentUser.username);
+    if (idx === -1 || users[idx].password !== current) {
+      return { success: false, error: 'Current password is incorrect.' };
+    }
+    users[idx] = { ...users[idx], password: next };
+    saveUsers(users);
+    return { success: true };
+  };
+
+  const handleExportBackup = () => {
+    if (!currentUser) return;
+    downloadJSON(`kikuubo-backup-${currentUser.username}-${todayISO()}.json`, {
+      exportedAt: new Date().toISOString(),
+      username: currentUser.username,
+      inventory,
+      sales,
+      notes,
+      settings,
+    });
+    addToast('Backup downloaded', 'success');
+  };
+
+  const handleImportBackup = (raw: string) => {
+    const backup = parseBackup(raw);
+    if (!backup) {
+      addToast('That file doesn\u2019t look like a valid backup', 'error');
+      return;
+    }
+    setConfirmState({
+      title: 'Restore this backup?',
+      message: `This will replace your current inventory, sales, and notes with the contents of the backup file (exported ${formatDateDMY(backup.exportedAt)}).`,
+      onConfirm: () => {
+        setInventory(backup.inventory);
+        setSales(backup.sales);
+        setNotes(backup.notes);
+        setSettings(backup.settings);
+        addToast('Backup restored', 'success');
+      },
+    });
+  };
+
+  const handleClearData = () => {
+    setConfirmState({
+      title: 'Clear all data?',
+      message: 'This permanently deletes every item, sale, and note on this account. This cannot be undone.',
+      onConfirm: () => {
+        setInventory([]);
+        setSales([]);
+        setNotes([]);
+        addToast('All data cleared', 'info');
+      },
+    });
+  };
+
   // New item form state
   const [newItem, setNewItem] = useState<Partial<InventoryItem>>({});
   const [newSale, setNewSale] = useState<Partial<SaleRecord>>({ date: todayISO() });
@@ -222,6 +310,7 @@ export default function App() {
   const totalProfitWeek = weekSales.reduce((sum, s) => sum + s.totalProfit, 0);
   const totalRevenueMonth = monthSales.reduce((sum, s) => sum + s.totalRevenue, 0);
   const totalProfitMonth = monthSales.reduce((sum, s) => sum + s.totalProfit, 0);
+  const inventoryValue = useMemo(() => inventory.reduce((sum, i) => sum + i.buyingPrice * i.currentStock, 0), [inventory]);
 
   const topItems = useMemo(() => {
     const counts = new Map<string, number>();
@@ -334,24 +423,6 @@ export default function App() {
     });
   };
 
-  const exportInventoryCSV = () => {
-    downloadCSV(
-      `kikuubo-inventory-${today}.csv`,
-      ['Item ID', 'Item Name', 'Buying Price', 'Selling Price', 'Current Stock', 'Reorder Level'],
-      inventory.map((i) => [i.id, i.name, i.buyingPrice, i.sellingPrice, i.currentStock, i.reorderLevel])
-    );
-    addToast('Inventory exported', 'success');
-  };
-
-  const exportSalesCSV = () => {
-    downloadCSV(
-      `kikuubo-sales-${today}.csv`,
-      ['Date', 'Item Name', 'Qty Sold', 'Revenue', 'Profit'],
-      sales.map((s) => [s.date, s.itemName, s.quantitySold, s.totalRevenue, s.totalProfit])
-    );
-    addToast('Sales log exported', 'success');
-  };
-
   // Navigate to tab and close mobile menu
   const handleTabChange = (tab: Tab) => {
     setActiveTab(tab);
@@ -364,11 +435,69 @@ export default function App() {
     return inventory.filter((i) => i.name.toLowerCase().includes(q) || i.id.toLowerCase().includes(q));
   }, [inventory, inventorySearch]);
 
+  const sortedInventory = useMemo(() => {
+    if (!inventorySort) return filteredInventory;
+    const { key, direction } = inventorySort;
+    return [...filteredInventory].sort((a, b) => {
+      const av = a[key];
+      const bv = b[key];
+      const cmp = typeof av === 'string' && typeof bv === 'string' ? av.localeCompare(bv) : Number(av) - Number(bv);
+      return direction === 'asc' ? cmp : -cmp;
+    });
+  }, [filteredInventory, inventorySort]);
+
+  const inventoryPageCount = Math.max(1, Math.ceil(sortedInventory.length / INVENTORY_PAGE_SIZE));
+  const clampedInventoryPage = Math.min(inventoryPage, inventoryPageCount);
+  const paginatedInventory = sortedInventory.slice(
+    (clampedInventoryPage - 1) * INVENTORY_PAGE_SIZE,
+    clampedInventoryPage * INVENTORY_PAGE_SIZE
+  );
+
+  const handleSortInventory = (key: InventorySort['key']) => {
+    setInventorySort((prev) => (prev?.key === key ? { key, direction: prev.direction === 'asc' ? 'desc' : 'asc' } : { key, direction: 'asc' }));
+    setInventoryPage(1);
+  };
+
+  const sortIndicator = (key: InventorySort['key']) => {
+    if (inventorySort?.key !== key) return null;
+    return <span className="text-cyan-400">{inventorySort.direction === 'asc' ? '↑' : '↓'}</span>;
+  };
+
   const filteredSales = useMemo(() => {
     const q = salesSearch.trim().toLowerCase();
-    const list = q ? sales.filter((s) => s.itemName.toLowerCase().includes(q) || s.date.includes(q)) : sales;
-    return list.slice().reverse();
-  }, [sales, salesSearch]);
+    return sales
+      .filter((s) => !q || s.itemName.toLowerCase().includes(q) || s.date.includes(q))
+      .filter((s) => !salesFrom || s.date >= salesFrom)
+      .filter((s) => !salesTo || s.date <= salesTo)
+      .slice()
+      .reverse();
+  }, [sales, salesSearch, salesFrom, salesTo]);
+
+  const salesFiltersActive = Boolean(salesSearch || salesFrom || salesTo);
+
+  const salesPageCount = Math.max(1, Math.ceil(filteredSales.length / SALES_PAGE_SIZE));
+  const clampedSalesPage = Math.min(salesPage, salesPageCount);
+  const paginatedSales = filteredSales.slice((clampedSalesPage - 1) * SALES_PAGE_SIZE, clampedSalesPage * SALES_PAGE_SIZE);
+
+  const exportInventoryCSV = () => {
+    downloadCSV(
+      `kikuubo-inventory-${today}.csv`,
+      ['Item ID', 'Item Name', 'Buying Price', 'Selling Price', 'Current Stock', 'Reorder Level'],
+      sortedInventory.map((i) => [i.id, i.name, i.buyingPrice, i.sellingPrice, i.currentStock, i.reorderLevel])
+    );
+    addToast('Inventory exported', 'success');
+  };
+
+  const exportSalesCSV = () => {
+    downloadCSV(
+      `kikuubo-sales-${today}.csv`,
+      ['Date', 'Item Name', 'Qty Sold', 'Revenue', 'Profit'],
+      filteredSales.map((s) => [s.date, s.itemName, s.quantitySold, s.totalRevenue, s.totalProfit])
+    );
+    addToast('Sales log exported', 'success');
+  };
+
+  const money = (amount: number) => formatMoney(amount, settings.currency);
 
   // ============ HOME PAGE ============
   if (page === 'home') {
@@ -618,6 +747,8 @@ export default function App() {
     );
   }
 
+  if (!currentUser) return null;
+
   // ============ MAIN APP ============
   return (
     <div className="min-h-screen bg-neutral-950 text-white">
@@ -634,20 +765,20 @@ export default function App() {
       <aside
         className={`fixed top-0 left-0 h-full w-72 bg-neutral-900 border-r border-neutral-800 z-50 transform transition-transform duration-300 lg:translate-x-0 ${sideMenuOpen ? 'translate-x-0' : '-translate-x-full'}`}
       >
-        <div className="p-6">
+        <div className="p-6 flex flex-col h-full">
           <div className="flex items-center gap-3 mb-8">
-            <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-cyan-500 to-emerald-500 flex items-center justify-center">
+            <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-cyan-500 to-emerald-500 flex items-center justify-center shrink-0">
               <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
               </svg>
             </div>
-            <div>
-              <span className="font-bold text-lg block">Kikuubo</span>
-              {currentUser && <span className="text-xs text-neutral-400">{currentUser.name}</span>}
+            <div className="min-w-0">
+              <span className="font-bold text-lg block truncate">{settings.businessName}</span>
+              <span className="text-xs text-neutral-400">{currentUser.name}</span>
             </div>
           </div>
 
-          <nav className="space-y-2">
+          <nav className="space-y-2 flex-1">
             <button
               onClick={() => handleTabChange('dashboard')}
               className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all ${activeTab === 'dashboard' ? 'bg-cyan-500/10 text-cyan-400' : 'text-neutral-400 hover:bg-neutral-800 hover:text-white'}`}
@@ -690,19 +821,28 @@ export default function App() {
               </svg>
               Notes
             </button>
-          </nav>
 
-          <div className="absolute bottom-6 left-6 right-6">
             <button
-              onClick={handleLogout}
-              className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-neutral-400 hover:bg-red-500/10 hover:text-red-400 transition-all"
+              onClick={() => handleTabChange('settings')}
+              className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all ${activeTab === 'settings' ? 'bg-cyan-500/10 text-cyan-400' : 'text-neutral-400 hover:bg-neutral-800 hover:text-white'}`}
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
               </svg>
-              Logout
+              Settings
             </button>
-          </div>
+          </nav>
+
+          <button
+            onClick={handleLogout}
+            className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-neutral-400 hover:bg-red-500/10 hover:text-red-400 transition-all mt-4"
+          >
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+            </svg>
+            Logout
+          </button>
         </div>
       </aside>
 
@@ -744,7 +884,7 @@ export default function App() {
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-cyan-400 text-sm font-medium uppercase tracking-wider">Revenue Today</p>
-                      <p className="text-2xl font-bold text-white mt-2">{formatCurrency(totalRevenueToday)}</p>
+                      <p className="text-2xl font-bold text-white mt-2">{money(totalRevenueToday)}</p>
                     </div>
                     <div className="w-12 h-12 rounded-full bg-cyan-500/10 flex items-center justify-center">
                       <svg className="w-6 h-6 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -758,7 +898,7 @@ export default function App() {
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-emerald-400 text-sm font-medium uppercase tracking-wider">Profit Today</p>
-                      <p className="text-2xl font-bold text-white mt-2">{formatCurrency(totalProfitToday)}</p>
+                      <p className="text-2xl font-bold text-white mt-2">{money(totalProfitToday)}</p>
                     </div>
                     <div className="w-12 h-12 rounded-full bg-emerald-500/10 flex items-center justify-center">
                       <svg className="w-6 h-6 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -797,29 +937,50 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Weekly / Monthly summary */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {/* Weekly / Monthly / Inventory value summary */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div className="bg-neutral-900/50 rounded-xl border border-neutral-800 p-6">
                   <p className="text-neutral-400 text-sm font-medium uppercase tracking-wider mb-3">This Week</p>
                   <div className="flex justify-between items-baseline">
                     <span className="text-neutral-500 text-sm">Revenue</span>
-                    <span className="text-lg font-semibold text-cyan-400">{formatCurrency(totalRevenueWeek)}</span>
+                    <span className="text-lg font-semibold text-cyan-400">{money(totalRevenueWeek)}</span>
                   </div>
                   <div className="flex justify-between items-baseline mt-2">
                     <span className="text-neutral-500 text-sm">Profit</span>
-                    <span className="text-lg font-semibold text-emerald-400">{formatCurrency(totalProfitWeek)}</span>
+                    <span className="text-lg font-semibold text-emerald-400">{money(totalProfitWeek)}</span>
                   </div>
                 </div>
                 <div className="bg-neutral-900/50 rounded-xl border border-neutral-800 p-6">
                   <p className="text-neutral-400 text-sm font-medium uppercase tracking-wider mb-3">This Month</p>
                   <div className="flex justify-between items-baseline">
                     <span className="text-neutral-500 text-sm">Revenue</span>
-                    <span className="text-lg font-semibold text-cyan-400">{formatCurrency(totalRevenueMonth)}</span>
+                    <span className="text-lg font-semibold text-cyan-400">{money(totalRevenueMonth)}</span>
                   </div>
                   <div className="flex justify-between items-baseline mt-2">
                     <span className="text-neutral-500 text-sm">Profit</span>
-                    <span className="text-lg font-semibold text-emerald-400">{formatCurrency(totalProfitMonth)}</span>
+                    <span className="text-lg font-semibold text-emerald-400">{money(totalProfitMonth)}</span>
                   </div>
+                </div>
+                <div className="bg-neutral-900/50 rounded-xl border border-neutral-800 p-6">
+                  <p className="text-neutral-400 text-sm font-medium uppercase tracking-wider mb-3">Inventory Value</p>
+                  <div className="flex justify-between items-baseline">
+                    <span className="text-neutral-500 text-sm">At cost</span>
+                    <span className="text-lg font-semibold text-violet-400">{money(inventoryValue)}</span>
+                  </div>
+                  <div className="flex justify-between items-baseline mt-2">
+                    <span className="text-neutral-500 text-sm">Items tracked</span>
+                    <span className="text-lg font-semibold text-white">{inventory.length}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Revenue Chart */}
+              <div className="bg-neutral-900/50 rounded-xl border border-neutral-800 overflow-hidden">
+                <div className="px-6 py-4 border-b border-neutral-800">
+                  <h3 className="text-lg font-semibold text-white">Revenue — Last 7 Days</h3>
+                </div>
+                <div className="p-6">
+                  <RevenueChart sales={sales} currency={settings.currency} />
                 </div>
               </div>
 
@@ -867,8 +1028,8 @@ export default function App() {
                               <td className="px-6 py-4 text-sm text-neutral-300">{sale.date}</td>
                               <td className="px-6 py-4 text-sm text-white">{sale.itemName}</td>
                               <td className="px-6 py-4 text-sm text-neutral-300">{sale.quantitySold}</td>
-                              <td className="px-6 py-4 text-sm text-cyan-400">{formatCurrency(sale.totalRevenue)}</td>
-                              <td className="px-6 py-4 text-sm text-emerald-400">{formatCurrency(sale.totalProfit)}</td>
+                              <td className="px-6 py-4 text-sm text-cyan-400">{money(sale.totalRevenue)}</td>
+                              <td className="px-6 py-4 text-sm text-emerald-400">{money(sale.totalProfit)}</td>
                             </tr>
                           ))}
                         {sales.length === 0 && (
@@ -940,13 +1101,18 @@ export default function App() {
               {/* Inventory Table */}
               <div className="bg-neutral-900/50 rounded-xl border border-neutral-800 overflow-hidden">
                 <div className="px-6 py-4 border-b border-neutral-800 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-                  <h3 className="text-lg font-semibold text-white">Inventory Master</h3>
+                  <h3 className="text-lg font-semibold text-white">
+                    Inventory Master <span className="text-neutral-500 font-normal text-sm">({sortedInventory.length})</span>
+                  </h3>
                   <div className="flex items-center gap-3">
                     <input
                       type="text"
                       placeholder="Search items..."
                       value={inventorySearch}
-                      onChange={(e) => setInventorySearch(e.target.value)}
+                      onChange={(e) => {
+                        setInventorySearch(e.target.value);
+                        setInventoryPage(1);
+                      }}
                       className="px-3 py-1.5 bg-neutral-800 border border-neutral-700 rounded-lg text-sm text-white placeholder-neutral-500 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                     />
                     <button
@@ -962,21 +1128,37 @@ export default function App() {
                     <thead className="bg-neutral-800/50">
                       <tr>
                         <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Item ID</th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Item Name</th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Buying Price</th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Selling Price</th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Stock</th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">
+                          <button onClick={() => handleSortInventory('name')} className="flex items-center gap-1 hover:text-white transition-colors">
+                            Item Name {sortIndicator('name')}
+                          </button>
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">
+                          <button onClick={() => handleSortInventory('buyingPrice')} className="flex items-center gap-1 hover:text-white transition-colors">
+                            Buying Price {sortIndicator('buyingPrice')}
+                          </button>
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">
+                          <button onClick={() => handleSortInventory('sellingPrice')} className="flex items-center gap-1 hover:text-white transition-colors">
+                            Selling Price {sortIndicator('sellingPrice')}
+                          </button>
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">
+                          <button onClick={() => handleSortInventory('currentStock')} className="flex items-center gap-1 hover:text-white transition-colors">
+                            Stock {sortIndicator('currentStock')}
+                          </button>
+                        </th>
                         <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Status</th>
                         <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Actions</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-neutral-800">
-                      {filteredInventory.map((item) => (
+                      {paginatedInventory.map((item) => (
                         <tr key={item.id} className="hover:bg-neutral-800/30">
                           <td className="px-6 py-4 text-sm text-neutral-400 font-mono">{item.id}</td>
                           <td className="px-6 py-4 text-sm text-white">{item.name}</td>
-                          <td className="px-6 py-4 text-sm text-neutral-300">{formatCurrency(item.buyingPrice)}</td>
-                          <td className="px-6 py-4 text-sm text-cyan-400">{formatCurrency(item.sellingPrice)}</td>
+                          <td className="px-6 py-4 text-sm text-neutral-300">{money(item.buyingPrice)}</td>
+                          <td className="px-6 py-4 text-sm text-cyan-400">{money(item.sellingPrice)}</td>
                           <td className="px-6 py-4 text-sm">
                             <div className="flex items-center gap-2">
                               <button onClick={() => updateStock(item.id, -1)} className="w-6 h-6 rounded bg-neutral-700 hover:bg-neutral-600 flex items-center justify-center">-</button>
@@ -1007,7 +1189,7 @@ export default function App() {
                           </td>
                         </tr>
                       ))}
-                      {filteredInventory.length === 0 && (
+                      {paginatedInventory.length === 0 && (
                         <tr>
                           <td colSpan={7} className="px-6 py-8 text-center text-neutral-500 text-sm">
                             {inventory.length === 0 ? 'No items in inventory yet. Add your first item above!' : 'No items match your search.'}
@@ -1017,6 +1199,13 @@ export default function App() {
                     </tbody>
                   </table>
                 </div>
+                <Pagination
+                  page={clampedInventoryPage}
+                  pageCount={inventoryPageCount}
+                  total={sortedInventory.length}
+                  pageSize={INVENTORY_PAGE_SIZE}
+                  onPageChange={setInventoryPage}
+                />
               </div>
             </div>
           )}
@@ -1064,22 +1253,63 @@ export default function App() {
 
               {/* Sales Table */}
               <div className="bg-neutral-900/50 rounded-xl border border-neutral-800 overflow-hidden">
-                <div className="px-6 py-4 border-b border-neutral-800 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-                  <h3 className="text-lg font-semibold text-white">Daily Sales Log</h3>
-                  <div className="flex items-center gap-3">
+                <div className="px-6 py-4 border-b border-neutral-800 space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                    <h3 className="text-lg font-semibold text-white">
+                      Daily Sales Log <span className="text-neutral-500 font-normal text-sm">({filteredSales.length})</span>
+                    </h3>
+                    <button
+                      onClick={exportSalesCSV}
+                      className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg text-sm text-neutral-300 whitespace-nowrap transition-all self-start sm:self-auto"
+                    >
+                      Export CSV
+                    </button>
+                  </div>
+                  <div className="flex flex-col sm:flex-row sm:items-center gap-3">
                     <input
                       type="text"
                       placeholder="Search by item or date..."
                       value={salesSearch}
-                      onChange={(e) => setSalesSearch(e.target.value)}
-                      className="px-3 py-1.5 bg-neutral-800 border border-neutral-700 rounded-lg text-sm text-white placeholder-neutral-500 focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                      onChange={(e) => {
+                        setSalesSearch(e.target.value);
+                        setSalesPage(1);
+                      }}
+                      className="px-3 py-1.5 bg-neutral-800 border border-neutral-700 rounded-lg text-sm text-white placeholder-neutral-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 flex-1"
                     />
-                    <button
-                      onClick={exportSalesCSV}
-                      className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg text-sm text-neutral-300 whitespace-nowrap transition-all"
-                    >
-                      Export CSV
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="date"
+                        value={salesFrom}
+                        onChange={(e) => {
+                          setSalesFrom(e.target.value);
+                          setSalesPage(1);
+                        }}
+                        className="px-3 py-1.5 bg-neutral-800 border border-neutral-700 rounded-lg text-sm text-white focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                      />
+                      <span className="text-neutral-500 text-sm">to</span>
+                      <input
+                        type="date"
+                        value={salesTo}
+                        onChange={(e) => {
+                          setSalesTo(e.target.value);
+                          setSalesPage(1);
+                        }}
+                        className="px-3 py-1.5 bg-neutral-800 border border-neutral-700 rounded-lg text-sm text-white focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                      />
+                      {salesFiltersActive && (
+                        <button
+                          onClick={() => {
+                            setSalesSearch('');
+                            setSalesFrom('');
+                            setSalesTo('');
+                            setSalesPage(1);
+                          }}
+                          className="text-xs text-neutral-500 hover:text-white whitespace-nowrap"
+                        >
+                          Clear filters
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
                 <div className="overflow-x-auto">
@@ -1095,13 +1325,13 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-neutral-800">
-                      {filteredSales.map((sale) => (
+                      {paginatedSales.map((sale) => (
                         <tr key={sale.id} className="hover:bg-neutral-800/30">
                           <td className="px-6 py-4 text-sm text-neutral-300">{sale.date}</td>
                           <td className="px-6 py-4 text-sm text-white">{sale.itemName}</td>
                           <td className="px-6 py-4 text-sm text-neutral-300">{sale.quantitySold}</td>
-                          <td className="px-6 py-4 text-sm text-cyan-400">{formatCurrency(sale.totalRevenue)}</td>
-                          <td className="px-6 py-4 text-sm text-emerald-400">{formatCurrency(sale.totalProfit)}</td>
+                          <td className="px-6 py-4 text-sm text-cyan-400">{money(sale.totalRevenue)}</td>
+                          <td className="px-6 py-4 text-sm text-emerald-400">{money(sale.totalProfit)}</td>
                           <td className="px-6 py-4">
                             <button onClick={() => deleteSale(sale.id)} className="text-red-400 hover:text-red-300">
                               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1111,16 +1341,23 @@ export default function App() {
                           </td>
                         </tr>
                       ))}
-                      {filteredSales.length === 0 && (
+                      {paginatedSales.length === 0 && (
                         <tr>
                           <td colSpan={6} className="px-6 py-8 text-center text-neutral-500 text-sm">
-                            {sales.length === 0 ? 'No sales recorded yet.' : 'No sales match your search.'}
+                            {sales.length === 0 ? 'No sales recorded yet.' : 'No sales match your filters.'}
                           </td>
                         </tr>
                       )}
                     </tbody>
                   </table>
                 </div>
+                <Pagination
+                  page={clampedSalesPage}
+                  pageCount={salesPageCount}
+                  total={filteredSales.length}
+                  pageSize={SALES_PAGE_SIZE}
+                  onPageChange={setSalesPage}
+                />
               </div>
             </div>
           )}
@@ -1188,6 +1425,19 @@ export default function App() {
               </div>
             </div>
           )}
+
+          {/* Settings Tab */}
+          {activeTab === 'settings' && (
+            <SettingsPanel
+              settings={settings}
+              onSaveSettings={handleSaveSettings}
+              currentUser={currentUser}
+              onChangePassword={handleChangePassword}
+              onExportBackup={handleExportBackup}
+              onImportBackup={handleImportBackup}
+              onClearData={handleClearData}
+            />
+          )}
         </main>
 
         {/* Footer */}
@@ -1202,7 +1452,7 @@ export default function App() {
                   <p className="text-neutral-400 text-sm">
                     Built by <span className="text-cyan-400 font-semibold">Andrew Lumala</span>
                   </p>
-                  <p className="text-neutral-600 text-xs">© {new Date().getFullYear()} Kikuubo Wholesale Tracker</p>
+                  <p className="text-neutral-600 text-xs">© {new Date().getFullYear()} {settings.businessName}</p>
                 </div>
               </div>
             </div>
